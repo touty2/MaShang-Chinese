@@ -9,8 +9,7 @@ type UseAuthOptions = {
 };
 
 export function useAuth(options?: UseAuthOptions) {
-  const { redirectOnUnauthenticated = false, redirectPath = getLoginUrl() } =
-    options ?? {};
+  const { redirectOnUnauthenticated = false, redirectPath } = options ?? {};
   const utils = trpc.useUtils();
 
   const meQuery = trpc.auth.me.useQuery(undefined, {
@@ -65,9 +64,12 @@ export function useAuth(options?: UseAuthOptions) {
     if (meQuery.isLoading || logoutMutation.isPending) return;
     if (state.user) return;
     if (typeof window === "undefined") return;
-    if (window.location.pathname === redirectPath) return;
-
-    window.location.href = redirectPath
+    // Lazily resolve the login URL only when we actually need to redirect.
+    // Calling getLoginUrl() eagerly at destructure time crashes on Render
+    // because VITE_OAUTH_PORTAL_URL is not set there — guard is in const.ts.
+    const resolvedPath = redirectPath ?? getLoginUrl();
+    if (window.location.pathname === resolvedPath) return;
+    window.location.href = resolvedPath;
   }, [
     redirectOnUnauthenticated,
     redirectPath,

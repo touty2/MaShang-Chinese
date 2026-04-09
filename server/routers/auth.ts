@@ -34,7 +34,10 @@ function getCookieOptions(req: { protocol?: string; headers?: Record<string, str
   return {
     httpOnly: true,
     secure: isSecure,
-    sameSite: isSecure ? ("none" as const) : ("lax" as const),
+    // Use "lax" (not "none") — frontend and backend share the same origin on Render,
+    // so same-site cookies work. "none" requires Partitioned in modern browsers and
+    // is blocked by Safari/Brave/Firefox strict mode.
+    sameSite: "lax" as const,
     path: "/",
     maxAge: 60 * 60 * 24 * 30, // 30 days
   };

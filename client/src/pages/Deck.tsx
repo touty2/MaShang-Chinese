@@ -38,6 +38,7 @@ import {
   loadSession, saveSession, clearSession, pruneOldSessions,
   makeSessionKey, serializeKey, type CardKey, type PersistedSession
 } from "@/lib/sessionStore";
+import { trpc } from "@/lib/trpc";
 
 // ─── Review Session ───────────────────────────────────────────────────────────
 
@@ -65,6 +66,9 @@ function ReviewSession({
   onDone: (reviewed: number) => void;
   onSaveSession: (session: PersistedSession) => void;
 }) {
+  // tRPC utils for fire-and-forget server push after each card rating
+  const utils = trpc.useUtils();
+
   // ── Build the queue ────────────────────────────────────────────────────────
   // If we have a persisted session, restore the queue from it (preserving
   // original order, minus already-reviewed cards).  Otherwise shuffle fresh.
@@ -157,7 +161,30 @@ function ReviewSession({
 
   const handleRate = useCallback(async (rating: Rating) => {
     if (!current) return;
-    await rateCard(current, rating, settings.desiredRetention, settings.maxInterval);
+    const updatedCard = await rateCard(current, rating, settings.desiredRetention, settings.maxInterval);
+    // Fire-and-forget: push the updated card to the server so progress persists
+    // across logins. Do NOT await — we don't want to block the UI.
+    utils.client.sync.pushFlashcards.mutate([{
+      word: updatedCard.word,
+      cardType: updatedCard.cardType,
+      stability: updatedCard.stability,
+      difficulty: updatedCard.difficulty,
+      scheduledDays: updatedCard.scheduledDays,
+      elapsedDays: updatedCard.elapsedDays,
+      reps: updatedCard.reps,
+      lapses: updatedCard.lapses,
+      isLeech: updatedCard.isLeech,
+      state: updatedCard.state,
+      dueDate: updatedCard.dueDate,
+      lastReviewed: updatedCard.lastReviewed,
+      pinyin: updatedCard.pinyin,
+      definition: updatedCard.definition,
+      hskBand: updatedCard.hskBand,
+      storyId: updatedCard.storyId,
+      updatedAt: updatedCard.updatedAt,
+    }]).catch((err) => {
+      console.warn("[Deck] Failed to push card to server (will sync later):", err);
+    });
     const newReviewed = reviewed + 1;
     const newReviewedKey = serializeKey(current);
     const newReviewedKeys = new Set(Array.from(reviewedKeys).concat(newReviewedKey));

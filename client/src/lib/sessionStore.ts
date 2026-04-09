@@ -1,30 +1,22 @@
 /**
- * sessionStore.ts
+ * sessionStore.ts — localStorage-based session persistence
  *
- * Persists the active flashcard review session to IndexedDB so that
- * refreshes, browser restarts, and re-logins all resume exactly where
- * the user left off.
+ * Why localStorage instead of IndexedDB?
+ * On every login, AuthContext calls clearAllCards() (IndexedDB) before
+ * hydrateFromServer() completes.  If the session was stored in IndexedDB it
+ * would be wiped on every login, losing the mid-session queue.
  *
- * Key design decisions
- * ────────────────────
- * • One session record per calendar day (local date string "YYYY-MM-DD").
- * • The session is identified by a stable `sessionKey` that encodes the
- *   date + the sorted set of selected deck IDs.  If the user changes deck
- *   selection, a fresh session starts automatically.
- * • The queue is stored as an ordered array of card keys
- *   `{ word, cardType }`.  The actual FlashCard data is NOT duplicated here;
- *   it is always read fresh from flashcardStore so FSRS updates are reflected.
- * • `reviewedKeys` is a Set of serialised keys for cards already rated in
- *   this session.  On restore the queue is rebuilt as
- *   (originalQueue minus reviewedKeys), preserving original order.
- * • A completed session (`isDone = true`) stays done until the next calendar
- *   day, at which point `loadSession` returns null (no session to restore).
+ * localStorage is NOT cleared by clearAllCards() or clearAllDecks(), so
+ * sessions survive the login/hydration cycle.  Sessions are keyed by
+ * userId + date so they are user-scoped and auto-expire after one day.
+ *
+ * Keys use the prefix "mashang_sess_" to avoid collisions with other
+ * localStorage entries.
  */
 
 import type { CardType } from "./flashcardStore";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-
 export interface CardKey {
   word: string;
   cardType: CardType;
@@ -47,35 +39,10 @@ export interface PersistedSession {
   updatedAt: number;
 }
 
-// ─── IndexedDB plumbing ───────────────────────────────────────────────────────
-
-const DB_NAME = "mashang_session";
-const DB_VERSION = 1;
-const STORE = "sessions";
-
-let _db: IDBDatabase | null = null;
-
-function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = (e) => {
-      const d = (e.target as IDBOpenDBRequest).result;
-      if (!d.objectStoreNames.contains(STORE)) {
-        d.createObjectStore(STORE, { keyPath: "sessionKey" });
-      }
-    };
-    req.onsuccess = (e) => resolve((e.target as IDBOpenDBRequest).result);
-    req.onerror = (e) => reject((e.target as IDBOpenDBRequest).error);
-  });
-}
-
-async function getDB(): Promise<IDBDatabase> {
-  if (!_db) _db = await openDB();
-  return _db;
-}
+// ─── Constants ────────────────────────────────────────────────────────────────
+const KEY_PREFIX = "mashang_sess_";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
 /** Local date string "YYYY-MM-DD" */
 function todayStr(): string {
   const d = new Date();
@@ -101,22 +68,21 @@ export function serializeKey(k: CardKey): string {
  * Load today's session for the given deck selection.
  * Returns null if no session exists for today or if the date has rolled over.
  */
-export async function loadSession(deckIds: string[], userId?: string): Promise<PersistedSession | null> {
+export async function loadSession(
+  deckIds: string[],
+  userId?: string
+): Promise<PersistedSession | null> {
   try {
-    const db = await getDB();
-    const key = makeSessionKey(deckIds, userId);
-    return await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readonly");
-      const req = tx.objectStore(STORE).get(key);
-      req.onsuccess = () => {
-        const rec = req.result as (PersistedSession & { sessionKey: string }) | undefined;
-        if (!rec) { resolve(null); return; }
-        // Expire if the date has rolled over
-        if (rec.date !== todayStr()) { resolve(null); return; }
-        resolve(rec);
-      };
-      req.onerror = () => reject(req.error);
-    });
+    const key = KEY_PREFIX + makeSessionKey(deckIds, userId);
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const rec = JSON.parse(raw) as PersistedSession;
+    // Expire if the date has rolled over
+    if (rec.date !== todayStr()) {
+      localStorage.removeItem(key);
+      return null;
+    }
+    return rec;
   } catch {
     return null;
   }
@@ -125,17 +91,15 @@ export async function loadSession(deckIds: string[], userId?: string): Promise<P
 /**
  * Save (upsert) the current session state.
  */
-export async function saveSession(deckIds: string[], session: PersistedSession, userId?: string): Promise<void> {
+export async function saveSession(
+  deckIds: string[],
+  session: PersistedSession,
+  userId?: string
+): Promise<void> {
   try {
-    const db = await getDB();
-    const key = makeSessionKey(deckIds, userId);
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      const rec = { ...session, sessionKey: key, updatedAt: Date.now() };
-      const req = tx.objectStore(STORE).put(rec);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
+    const key = KEY_PREFIX + makeSessionKey(deckIds, userId);
+    const rec: PersistedSession = { ...session, updatedAt: Date.now() };
+    localStorage.setItem(key, JSON.stringify(rec));
   } catch (err) {
     console.warn("[sessionStore] saveSession failed:", err);
   }
@@ -144,18 +108,34 @@ export async function saveSession(deckIds: string[], session: PersistedSession, 
 /**
  * Delete the session for the given deck selection (e.g. on manual reset).
  */
-export async function clearSession(deckIds: string[], userId?: string): Promise<void> {
+export async function clearSession(
+  deckIds: string[],
+  userId?: string
+): Promise<void> {
   try {
-    const db = await getDB();
-    const key = makeSessionKey(deckIds, userId);
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      const req = tx.objectStore(STORE).delete(key);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
+    const key = KEY_PREFIX + makeSessionKey(deckIds, userId);
+    localStorage.removeItem(key);
   } catch (err) {
     console.warn("[sessionStore] clearSession failed:", err);
+  }
+}
+
+/**
+ * Clear all sessions for a specific user (call on logout so the next user
+ * doesn't see a previous user's session).
+ */
+export async function clearUserSessions(userId: string): Promise<void> {
+  try {
+    const toRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(KEY_PREFIX) && k.includes(userId)) {
+        toRemove.push(k);
+      }
+    }
+    for (const k of toRemove) localStorage.removeItem(k);
+  } catch (err) {
+    console.warn("[sessionStore] clearUserSessions failed:", err);
   }
 }
 
@@ -164,21 +144,21 @@ export async function clearSession(deckIds: string[], userId?: string): Promise<
  */
 export async function pruneOldSessions(): Promise<void> {
   try {
-    const db = await getDB();
     const today = todayStr();
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      const store = tx.objectStore(STORE);
-      const req = store.openCursor();
-      req.onsuccess = () => {
-        const cursor = req.result as IDBCursorWithValue | null;
-        if (!cursor) { resolve(); return; }
-        const rec = cursor.value as PersistedSession;
-        if (rec.date !== today) cursor.delete();
-        cursor.continue();
-      };
-      req.onerror = () => reject(req.error);
-    });
+    const toRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(KEY_PREFIX)) continue;
+      try {
+        const raw = localStorage.getItem(k);
+        if (!raw) continue;
+        const rec = JSON.parse(raw) as PersistedSession;
+        if (rec.date !== today) toRemove.push(k);
+      } catch {
+        toRemove.push(k!);
+      }
+    }
+    for (const k of toRemove) localStorage.removeItem(k);
   } catch {
     // Non-critical — ignore
   }
