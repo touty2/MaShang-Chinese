@@ -19,7 +19,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { toast } from "sonner";
 import {
-  getAllCards, getDueCards, rateCard, removeWord,
+  getAllCards, rateCard, removeWord,
   getIntervalLabel, Rating, State, type FlashCard
 } from "@/lib/flashcardStore";
 import {
@@ -32,33 +32,59 @@ import { cn } from "@/lib/utils";
 import { addWord } from "@/lib/flashcardStore";
 import { addWordToDeck } from "@/lib/deckStore";
 import { loadDictionary, lookupWord } from "@/lib/dictionary";
+import {
+  loadSession, saveSession, clearSession, pruneOldSessions,
+  makeSessionKey, serializeKey, type CardKey, type PersistedSession
+} from "@/lib/sessionStore";
 
 // ─── Review Session ───────────────────────────────────────────────────────────
 
+/**
+ * ReviewSession now accepts an optional `initialSession` that lets it resume
+ * a previously persisted session.  After every card rating it calls
+ * `onSaveSession` so the parent can persist the updated state.
+ */
 function ReviewSession({
   cards,
+  allCards,
   settings,
+  deckIds,
+  initialSession,
   onDone,
+  onSaveSession,
 }: {
+  /** Due cards for a fresh session */
   cards: FlashCard[];
+  /** All cards (for restoring a persisted session queue) */
+  allCards: FlashCard[];
   settings: ReturnType<typeof useSettings>["settings"];
+  deckIds: string[];
+  initialSession: PersistedSession | null;
   onDone: (reviewed: number) => void;
+  onSaveSession: (session: PersistedSession) => void;
 }) {
-  // Shuffle once using a stable ref.
-  // Uses an anti-adjacency shuffle: after a standard Fisher-Yates shuffle,
-  // if two consecutive cards share the same word, swap the second one with
-  // a later card to prevent the same word appearing back-to-back.
-  const initialQueue = useRef<FlashCard[]>((() => {
+  // ── Build the queue ────────────────────────────────────────────────────────
+  // If we have a persisted session, restore the queue from it (preserving
+  // original order, minus already-reviewed cards).  Otherwise shuffle fresh.
+  const buildQueue = useCallback((): FlashCard[] => {
+    if (initialSession && initialSession.originalQueue.length > 0) {
+      const reviewedSet = new Set(initialSession.reviewedKeys);
+      // Use allCards (not just due cards) so we can look up any card in the original queue,
+      // including cards whose dueDate was updated after being reviewed in this session.
+      const cardMap = new Map(allCards.map((c) => [serializeKey(c), c]));
+      return initialSession.originalQueue
+        .filter((k) => !reviewedSet.has(serializeKey(k)))
+        .map((k) => cardMap.get(serializeKey(k)))
+        .filter((c): c is FlashCard => c !== undefined);
+    }
+    // Fresh shuffle with anti-adjacency pass
     const shuffled = [...cards];
-    // Fisher-Yates
     for (let i = shuffled.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
-    // Anti-adjacency pass: move same-word neighbours apart
     for (let i = 0; i < shuffled.length - 1; i++) {
       if (shuffled[i].word === shuffled[i + 1].word) {
-        // Find the next card with a different word to swap with
         const swapIdx = shuffled.findIndex((c, k) => k > i + 1 && c.word !== shuffled[i].word);
         if (swapIdx !== -1) {
           [shuffled[i + 1], shuffled[swapIdx]] = [shuffled[swapIdx], shuffled[i + 1]];
@@ -66,13 +92,42 @@ function ReviewSession({
       }
     }
     return shuffled;
-  })());
-  const [queue, setQueue] = useState<FlashCard[]>(initialQueue.current);
-  // current always tracks queue[0]
-  const [current, setCurrent] = useState<FlashCard | null>(initialQueue.current[0] ?? null);
+  }, []); // intentionally stable — only runs once on mount
+
+  // Build original queue for persistence (full ordered list before any reviews)
+  const originalQueueRef = useRef<CardKey[]>(
+    initialSession?.originalQueue ??
+    (() => {
+      // We need the same shuffle order — compute it once here
+      const shuffled = [...cards];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      for (let i = 0; i < shuffled.length - 1; i++) {
+        if (shuffled[i].word === shuffled[i + 1].word) {
+          const swapIdx = shuffled.findIndex((c, k) => k > i + 1 && c.word !== shuffled[i].word);
+          if (swapIdx !== -1) {
+            [shuffled[i + 1], shuffled[swapIdx]] = [shuffled[swapIdx], shuffled[i + 1]];
+          }
+        }
+      }
+      return shuffled.map((c) => ({ word: c.word, cardType: c.cardType }));
+    })()
+  );
+
+  const initialQueueRef = useRef<FlashCard[]>(buildQueue());
+  const [queue, setQueue] = useState<FlashCard[]>(initialQueueRef.current);
+  const [current, setCurrent] = useState<FlashCard | null>(initialQueueRef.current[0] ?? null);
   const [flipped, setFlipped] = useState(false);
-  const [reviewed, setReviewed] = useState(0);
-  const [sessionDone, setSessionDone] = useState(false);
+  const [reviewed, setReviewed] = useState(initialSession?.reviewed ?? 0);
+  const [reviewedKeys, setReviewedKeys] = useState<Set<string>>(
+    new Set(initialSession?.reviewedKeys ?? [])
+  );
+  const [sessionDone, setSessionDone] = useState(
+    // Restore done state: if session was completed AND no new cards have appeared
+    () => (initialSession?.isDone ?? false) && initialQueueRef.current.length === 0
+  );
   const [largeFontMode, setLargeFontMode] = useState(false);
 
   const speak = useCallback((text: string) => {
@@ -84,7 +139,6 @@ function ReviewSession({
     window.speechSynthesis.speak(utt);
   }, [settings.ttsSpeed]);
 
-  // Two-way flip toggle — click to flip, click again to flip back
   const handleFlip = useCallback(() => {
     setFlipped((prev) => {
       const next = !prev;
@@ -99,9 +153,27 @@ function ReviewSession({
     if (!current) return;
     await rateCard(current, rating, settings.desiredRetention, settings.maxInterval);
     const newReviewed = reviewed + 1;
+    const newReviewedKey = serializeKey(current);
+    const newReviewedKeys = new Set(Array.from(reviewedKeys).concat(newReviewedKey));
     setReviewed(newReviewed);
+    setReviewedKeys(newReviewedKeys);
+
     const remaining = queue.slice(1);
-    if (remaining.length === 0) {
+    const isDone = remaining.length === 0;
+
+    // Persist after every rating
+    const updatedSession: PersistedSession = {
+      date: new Date().toLocaleDateString("sv"), // "YYYY-MM-DD"
+      deckKey: [...deckIds].sort().join(","),
+      originalQueue: originalQueueRef.current,
+      reviewedKeys: Array.from(newReviewedKeys),
+      reviewed: newReviewed,
+      isDone,
+      updatedAt: Date.now(),
+    };
+    onSaveSession(updatedSession);
+
+    if (isDone) {
       setSessionDone(true);
       onDone(newReviewed);
     } else {
@@ -109,7 +181,7 @@ function ReviewSession({
       setCurrent(remaining[0]);
       setFlipped(false);
     }
-  }, [current, queue, reviewed, settings, onDone]);
+  }, [current, queue, reviewed, reviewedKeys, deckIds, settings, onDone, onSaveSession]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -208,7 +280,7 @@ function ReviewSession({
         </div>
       </div>
 
-      {/* Controls row: I Know + speaker + speed */}
+      {/* Controls row: speaker + font size */}
       <div className="flex items-center gap-3">
         <button
           onClick={(e) => { e.stopPropagation(); speak(current.word); }}
@@ -256,8 +328,6 @@ function ReviewSession({
 
       {/* Placeholder to keep layout stable before flip */}
       {!flipped && <div className="h-4" />}
-
-
     </div>
   );
 }
@@ -287,94 +357,94 @@ function DeckTogglePanel({
   const [renaming, setRenaming] = useState<{ id: string; name: string } | null>(null);
   const [deleting, setDeleting] = useState<LocalDeck | null>(null);
 
-  const handleCreate = () => {
-    if (!newDeckName.trim()) return;
-    onCreateDeck(newDeckName.trim());
-    setNewDeckName("");
-    setCreating(false);
-  };
-
-  const totalSelected = Array.from(selectedDeckIds).reduce((sum, id) => sum + (counts[id] ?? 0), 0);
+  const systemDecks = decks.filter((d) => d.id === MAIN_DECK_ID || d.id === MY_VOCAB_ID);
+  const customDecks = decks.filter((d) => d.id !== MAIN_DECK_ID && d.id !== MY_VOCAB_ID);
 
   return (
-    <div className="rounded-xl border bg-card shadow-sm">
+    <div className="border border-border rounded-xl overflow-hidden">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-foreground hover:bg-muted/50 transition-colors rounded-xl"
+        className="w-full flex items-center justify-between px-4 py-3 bg-muted/30 hover:bg-muted/50 transition-colors"
       >
-        <span className="flex items-center gap-2">
-          <Layers className="w-4 h-4 text-muted-foreground" />
-          Decks
-          <Badge variant="secondary" className="text-xs">{selectedDeckIds.size} selected · {totalSelected} words</Badge>
+        <span className="text-sm font-medium text-foreground">
+          Decks ({selectedDeckIds.size} selected)
         </span>
         {open ? <ChevronUp className="w-4 h-4 text-muted-foreground" /> : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
       </button>
 
       {open && (
-        <div className="border-t px-4 py-3 space-y-2">
-          {decks.map((deck) => (
-            <div key={deck.id} className="flex items-center gap-2 group">
+        <div className="p-3 space-y-1 border-t border-border">
+          {/* System decks */}
+          {systemDecks.map((deck) => (
+            <label key={deck.id} className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg hover:bg-muted/40 cursor-pointer">
               <Checkbox
-                id={`deck-${deck.id}`}
                 checked={selectedDeckIds.has(deck.id)}
                 onCheckedChange={() => onToggle(deck.id)}
               />
-              <Label
-                htmlFor={`deck-${deck.id}`}
-                className="flex-1 text-sm cursor-pointer flex items-center gap-2"
+              <span className="text-sm text-foreground flex-1">{deck.name}</span>
+              <Badge variant="secondary" className="text-xs">{counts[deck.id] ?? 0}</Badge>
+            </label>
+          ))}
+
+          {/* Custom decks */}
+          {customDecks.map((deck) => (
+            <div key={deck.id} className="flex items-center gap-1 group">
+              <label className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg hover:bg-muted/40 cursor-pointer flex-1">
+                <Checkbox
+                  checked={selectedDeckIds.has(deck.id)}
+                  onCheckedChange={() => onToggle(deck.id)}
+                />
+                <span className="text-sm text-foreground flex-1">{deck.name}</span>
+                <Badge variant="secondary" className="text-xs">{counts[deck.id] ?? 0}</Badge>
+              </label>
+              <button
+                onClick={() => setRenaming({ id: deck.id, name: deck.name })}
+                className="p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-muted transition-all"
               >
-                <span className="flex flex-col">
-                  <span>{deck.name}</span>
-                  {deck.id === MAIN_DECK_ID && (
-                    <span className="text-xs text-muted-foreground font-normal">Words from stories</span>
-                  )}
-                  {deck.id === MY_VOCAB_ID && (
-                    <span className="text-xs text-muted-foreground font-normal">Manually added words</span>
-                  )}
-                </span>
-                <span className="text-xs text-muted-foreground">({counts[deck.id] ?? 0})</span>
-              </Label>
-              {!deck.isSystem && (
-                <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button
-                    onClick={() => setRenaming({ id: deck.id, name: deck.name })}
-                    className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
-                  >
-                    <Edit2 className="w-3.5 h-3.5" />
-                  </button>
-                  <button
-                    onClick={() => setDeleting(deck)}
-                    className="p-1 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              )}
+                <Edit2 className="w-3.5 h-3.5 text-muted-foreground" />
+              </button>
+              <button
+                onClick={() => setDeleting(deck)}
+                className="p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-destructive/10 hover:text-destructive transition-all"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
             </div>
           ))}
 
           {/* Create new deck */}
           {creating ? (
-            <div className="flex gap-2 pt-1">
+            <div className="flex gap-2 mt-2 px-2">
               <Input
                 autoFocus
                 placeholder="Deck name…"
                 value={newDeckName}
                 onChange={(e) => setNewDeckName(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") handleCreate(); if (e.key === "Escape") setCreating(false); }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && newDeckName.trim()) {
+                    onCreateDeck(newDeckName.trim());
+                    setNewDeckName("");
+                    setCreating(false);
+                  }
+                  if (e.key === "Escape") { setCreating(false); setNewDeckName(""); }
+                }}
                 className="h-8 text-sm"
               />
-              <Button size="sm" onClick={handleCreate} disabled={!newDeckName.trim()} className="h-8 px-3">
-                <Check className="w-3.5 h-3.5" />
-              </Button>
-              <Button size="sm" variant="ghost" onClick={() => setCreating(false)} className="h-8 px-2">
+              <Button size="sm" className="h-8 px-3" onClick={() => {
+                if (newDeckName.trim()) {
+                  onCreateDeck(newDeckName.trim());
+                  setNewDeckName("");
+                  setCreating(false);
+                }
+              }}>Add</Button>
+              <Button size="sm" variant="ghost" className="h-8 px-2" onClick={() => { setCreating(false); setNewDeckName(""); }}>
                 <X className="w-3.5 h-3.5" />
               </Button>
             </div>
           ) : (
             <button
               onClick={() => setCreating(true)}
-              className="flex items-center gap-1.5 text-xs text-primary hover:underline mt-1"
+              className="flex items-center gap-1.5 px-2 py-1.5 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/40 rounded-lg w-full transition-colors mt-1"
             >
               <Plus className="w-3.5 h-3.5" /> New deck
             </button>
@@ -385,25 +455,28 @@ function DeckTogglePanel({
       {/* Rename dialog */}
       <Dialog open={!!renaming} onOpenChange={(o) => { if (!o) setRenaming(null); }}>
         <DialogContent>
-          <DialogHeader><DialogTitle>Rename deck</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>Rename deck</DialogTitle>
+          </DialogHeader>
           <Input
+            autoFocus
             value={renaming?.name ?? ""}
-            onChange={(e) => setRenaming((r) => r ? { ...r, name: e.target.value } : null)}
+            onChange={(e) => setRenaming((r) => r ? { ...r, name: e.target.value } : r)}
             onKeyDown={(e) => {
               if (e.key === "Enter" && renaming?.name.trim()) {
-                onRenameDeck(renaming.id, renaming.name);
+                onRenameDeck(renaming.id, renaming.name.trim());
                 setRenaming(null);
               }
             }}
           />
           <DialogFooter>
             <Button variant="outline" onClick={() => setRenaming(null)}>Cancel</Button>
-            <Button
-              disabled={!renaming?.name.trim()}
-              onClick={() => { if (renaming) { onRenameDeck(renaming.id, renaming.name); setRenaming(null); } }}
-            >
-              Rename
-            </Button>
+            <Button onClick={() => {
+              if (renaming?.name.trim()) {
+                onRenameDeck(renaming.id, renaming.name.trim());
+                setRenaming(null);
+              }
+            }}>Save</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -414,7 +487,7 @@ function DeckTogglePanel({
           <AlertDialogHeader>
             <AlertDialogTitle>Delete "{deleting?.name}"?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will remove the deck and all its word assignments. The words themselves and their SRS progress will not be deleted.
+              This removes the deck and its word list. The flashcards themselves are kept.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -443,6 +516,10 @@ export default function Deck() {
   const [deckCounts, setDeckCounts] = useState<Record<string, number>>({});
   const [selectedDeckIds, setSelectedDeckIds] = useState<Set<string>>(new Set([MAIN_DECK_ID, MY_VOCAB_ID]));
   const [deckWordSets, setDeckWordSets] = useState<Record<string, Set<string>>>({});
+
+  // ── Persistent session state ───────────────────────────────────────────────
+  const [persistedSession, setPersistedSession] = useState<PersistedSession | null>(null);
+  const [sessionLoaded, setSessionLoaded] = useState(false);
 
   // ── Add Word dialog state ──────────────────────────────────────────────────
   const [addOpen, setAddOpen] = useState(false);
@@ -494,7 +571,6 @@ export default function Deck() {
     setDecks(allDecks);
     setDeckCounts(counts);
 
-    // Build word sets per deck
     const sets: Record<string, Set<string>> = {};
     for (const deck of allDecks) {
       const words = await getWordsInDeck(deck.id);
@@ -504,7 +580,21 @@ export default function Deck() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { loadAll(); }, [loadAll]);
+  // On mount: prune old sessions and load today's session for the current deck selection
+  useEffect(() => {
+    pruneOldSessions();
+    loadAll();
+  }, [loadAll]);
+
+  // Load persisted session whenever deck selection changes
+  useEffect(() => {
+    if (loading) return;
+    const deckIds = Array.from(selectedDeckIds);
+    loadSession(deckIds).then((session) => {
+      setPersistedSession(session);
+      setSessionLoaded(true);
+    });
+  }, [selectedDeckIds, loading]);
 
   const handleAddWordSubmit = useCallback(async () => {
     if (!newWord.trim()) return;
@@ -517,7 +607,6 @@ export default function Deck() {
   }, [newWord, newPinyin, newDef, loadAll]);
 
   // Cards to review = cards whose word is in ANY selected deck
-  // Main Deck is a catch-all: it includes ALL cards in the flashcard store
   const filteredDueCards = (() => {
     if (selectedDeckIds.size === 0) return [];
     const now = Date.now();
@@ -525,18 +614,14 @@ export default function Deck() {
     const allowedWords = new Set<string>();
 
     if (mainSelected) {
-      // Main Deck = words added from stories
       Array.from(deckWordSets[MAIN_DECK_ID] ?? []).forEach((w) => allowedWords.add(w));
     }
-    // Add words from other selected decks (including My Words)
     Array.from(selectedDeckIds).forEach((id) => {
       if (id === MAIN_DECK_ID) return;
       Array.from(deckWordSets[id] ?? []).forEach((w) => allowedWords.add(w));
     });
 
-    // Always default to zh_en direction; only use en_zh or mixed if explicitly set
     const direction = settings.cardDirection ?? "zh_en";
-
     let due = allCards.filter((c) => {
       if (!allowedWords.has(c.word)) return false;
       if (direction !== "mixed" && c.cardType !== direction) return false;
@@ -547,8 +632,6 @@ export default function Deck() {
       if (b.state === 0 && a.state !== 0) return 1;
       return a.dueDate - b.dueDate;
     });
-    // In mixed mode, interleave zh_en and en_zh so the same word never appears
-    // back-to-back. Dedupe by word within each direction bucket then interleave.
     if (direction === "mixed") {
       const zhEn = due.filter((c) => c.cardType === "zh_en");
       const enZh = due.filter((c) => c.cardType === "en_zh");
@@ -598,19 +681,60 @@ export default function Deck() {
     toast.success(`Deleted "${deck?.name ?? "deck"}"`);
   };
 
+  // Persist session state after each card rating
+  const handleSaveSession = useCallback(async (session: PersistedSession) => {
+    const deckIds = Array.from(selectedDeckIds);
+    await saveSession(deckIds, session);
+    setPersistedSession(session);
+  }, [selectedDeckIds]);
+
+  // Determine if we should auto-resume into the review screen:
+  // - There is a persisted session for today
+  // - The session is not yet done (or it's done but new cards appeared)
+  const shouldAutoResume = sessionLoaded && persistedSession !== null && !persistedSession.isDone;
+
+  // Auto-open review screen when a resumable session exists
+  useEffect(() => {
+    if (shouldAutoResume && !reviewing && !loading) {
+      setReviewing(true);
+    }
+  }, [shouldAutoResume, reviewing, loading]);
+
+  // Completed session: show "All done" screen if session is done and no new cards
+  const sessionCompletedToday = sessionLoaded && persistedSession?.isDone === true && filteredDueCards.length === 0;
+
   if (reviewing) {
     return (
       <div className="p-6 max-w-2xl mx-auto">
         <div className="flex items-center gap-3 mb-6">
-          <Button variant="ghost" size="sm" onClick={() => { setReviewing(false); loadAll(); }}>
+          <Button variant="ghost" size="sm" onClick={async () => {
+            // Clear the session so the user can restart fresh if they exit mid-session
+            await clearSession(Array.from(selectedDeckIds));
+            setPersistedSession(null);
+            setReviewing(false);
+            loadAll();
+          }}>
             <X className="w-4 h-4 mr-1" /> Exit
           </Button>
           <h1 className="font-semibold text-foreground">Review Session</h1>
+          {persistedSession && !persistedSession.isDone && persistedSession.reviewed > 0 && (
+            <span className="text-xs text-muted-foreground ml-auto">Resumed from {persistedSession.reviewed} reviewed</span>
+          )}
         </div>
         <ReviewSession
           cards={filteredDueCards}
+          allCards={allCards}
           settings={settings}
-          onDone={() => { setReviewing(false); loadAll(); }}
+          deckIds={Array.from(selectedDeckIds)}
+          initialSession={persistedSession}
+          onSaveSession={handleSaveSession}
+          onDone={async () => {
+            setReviewing(false);
+            await loadAll();
+            // Reload the persisted session to reflect isDone=true
+            const updated = await loadSession(Array.from(selectedDeckIds));
+            setPersistedSession(updated);
+          }}
         />
       </div>
     );
@@ -668,15 +792,45 @@ export default function Deck() {
         />
       )}
 
-      {/* Start review */}
-      {loading ? (
+      {/* Start / resume review */}
+      {loading || !sessionLoaded ? (
         <div className="flex items-center justify-center py-8">
           <Loader2 className="w-6 h-6 animate-spin text-primary" />
         </div>
+      ) : sessionCompletedToday ? (
+        // Session completed today — show "All done" until tomorrow's cards arrive
+        <Card className="bg-emerald-50 dark:bg-emerald-900/20 border-emerald-200 dark:border-emerald-800">
+          <CardContent className="p-4 flex items-center gap-3">
+            <Check className="w-5 h-5 text-emerald-600 flex-shrink-0" />
+            <div className="flex-1">
+              <p className="font-medium text-sm text-foreground">All done for today!</p>
+              <p className="text-xs text-muted-foreground">
+                You reviewed {persistedSession?.reviewed ?? 0} card{(persistedSession?.reviewed ?? 0) !== 1 ? "s" : ""} today. Come back tomorrow for more.
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={async () => {
+                await clearSession(Array.from(selectedDeckIds));
+                setPersistedSession(null);
+                await loadAll();
+              }}
+            >
+              Reset
+            </Button>
+          </CardContent>
+        </Card>
       ) : filteredDueCards.length > 0 ? (
-        <Button size="lg" className="w-full gap-2" onClick={() => setReviewing(true)}>
+        <Button
+          size="lg"
+          className="w-full gap-2"
+          onClick={() => setReviewing(true)}
+        >
           <Layers className="w-5 h-5" />
-          Review {filteredDueCards.length} card{filteredDueCards.length !== 1 ? "s" : ""} due today
+          {persistedSession && !persistedSession.isDone && persistedSession.reviewed > 0
+            ? `Resume session — ${filteredDueCards.length} card${filteredDueCards.length !== 1 ? "s" : ""} left`
+            : `Review ${filteredDueCards.length} card${filteredDueCards.length !== 1 ? "s" : ""} due today`}
         </Button>
       ) : (
         <Card className="bg-emerald-50 dark:bg-emerald-900/20 border-emerald-200 dark:border-emerald-800">
@@ -741,6 +895,7 @@ export default function Deck() {
           </Button>
         </div>
       )}
+
       {/* Add Word dialog */}
       <Dialog open={addOpen} onOpenChange={(o) => { setAddOpen(o); if (!o) { setNewWord(""); setNewPinyin(""); setNewDef(""); setLookupNotFound(false); } }}>
         <DialogContent>
@@ -794,6 +949,7 @@ export default function Deck() {
     </div>
   );
 }
+
 function StateChip({ state }: { state: number }) {
   const labels: Record<number, { label: string; color: string }> = {
     0: { label: "New",     color: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400" },

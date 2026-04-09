@@ -70,7 +70,14 @@
 - [x] DB migration: all 11 tables created with TiDB-compatible syntax
 - [x] Custom email/password auth context (overrides Manus OAuth SDK)
 
+## Persistent Flashcard Session (Bug Fix)
+- [x] Implement date-keyed session store in IndexedDB (sessionStore.ts)
+- [x] On Deck page mount: restore today's session queue, current card index, and per-card reviewed status
+- [x] After each card review: auto-save session state to IndexedDB
+- [x] Completed session stays on "All done" screen until next day's cards arrive
+- [x] Session state survives browser restarts and re-logins
+
 ## Future Enhancements
 - [ ] Pinyin display toggle (show/hide pinyin above characters in story reader)
 - [ ] Story deck auto-generation from story vocabulary
-- [ ] Sessions page: reading session history and stats
+- [x] Sessions page: story browser with HSK tabs, search, completion tracking

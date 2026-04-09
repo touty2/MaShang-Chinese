@@ -3,6 +3,7 @@ import { trpc } from "@/lib/trpc";
 import { hydrateFromServer, performSync, shouldSync } from "@/lib/syncService";
 import { clearAllCards } from "@/lib/flashcardStore";
 import { clearAllDecks } from "@/lib/deckStore";
+import { pruneOldSessions } from "@/lib/sessionStore";
 
 export interface AuthUser {
   id: number;
@@ -32,6 +33,8 @@ const AuthContext = createContext<AuthContextValue>({
 async function clearLocalUserData(): Promise<void> {
   await clearAllCards();
   await clearAllDecks();
+  // Wipe persisted review sessions so a different user doesn't resume a previous user's queue.
+  await pruneOldSessions();
   const keysToRemove = [
     "mashang_completed",
     "mashang_my_words",
