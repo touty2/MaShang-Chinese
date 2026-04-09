@@ -292,11 +292,7 @@ class SDKServer {
       throw ForbiddenError("User not found");
     }
 
-    await db.upsertUser({
-      openId: user.openId,
-      lastSignedIn: signedInAt,
-    });
-
+    // Custom auth: session managed by email/password auth router
     return user;
   }
 }

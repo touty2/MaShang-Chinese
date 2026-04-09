@@ -1,5 +1,27 @@
 {
   "version": "7",
   "dialect": "mysql",
-  "entries": []
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1775386968840,
+      "tag": "0000_tan_the_anarchist",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1775387128326,
+      "tag": "0001_concerned_mandroid",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1775400145186,
+      "tag": "0002_aspiring_blindfold",
+      "breakpoints": true
+    }
+  ]
 }
