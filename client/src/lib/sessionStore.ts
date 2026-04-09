@@ -85,9 +85,10 @@ function todayStr(): string {
   return `${y}-${m}-${day}`;
 }
 
-/** Stable session key: date + sorted deck IDs */
-export function makeSessionKey(deckIds: string[]): string {
-  return `${todayStr()}::${[...deckIds].sort().join(",")}`;
+/** Stable session key: date + user + sorted deck IDs */
+export function makeSessionKey(deckIds: string[], userId?: string): string {
+  const userPart = userId ? `${userId}::` : "";
+  return `${todayStr()}::${userPart}${[...deckIds].sort().join(",")}`;
 }
 
 export function serializeKey(k: CardKey): string {
@@ -100,10 +101,10 @@ export function serializeKey(k: CardKey): string {
  * Load today's session for the given deck selection.
  * Returns null if no session exists for today or if the date has rolled over.
  */
-export async function loadSession(deckIds: string[]): Promise<PersistedSession | null> {
+export async function loadSession(deckIds: string[], userId?: string): Promise<PersistedSession | null> {
   try {
     const db = await getDB();
-    const key = makeSessionKey(deckIds);
+    const key = makeSessionKey(deckIds, userId);
     return await new Promise((resolve, reject) => {
       const tx = db.transaction(STORE, "readonly");
       const req = tx.objectStore(STORE).get(key);
@@ -124,10 +125,10 @@ export async function loadSession(deckIds: string[]): Promise<PersistedSession |
 /**
  * Save (upsert) the current session state.
  */
-export async function saveSession(deckIds: string[], session: PersistedSession): Promise<void> {
+export async function saveSession(deckIds: string[], session: PersistedSession, userId?: string): Promise<void> {
   try {
     const db = await getDB();
-    const key = makeSessionKey(deckIds);
+    const key = makeSessionKey(deckIds, userId);
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE, "readwrite");
       const rec = { ...session, sessionKey: key, updatedAt: Date.now() };
@@ -143,10 +144,10 @@ export async function saveSession(deckIds: string[], session: PersistedSession):
 /**
  * Delete the session for the given deck selection (e.g. on manual reset).
  */
-export async function clearSession(deckIds: string[]): Promise<void> {
+export async function clearSession(deckIds: string[], userId?: string): Promise<void> {
   try {
     const db = await getDB();
-    const key = makeSessionKey(deckIds);
+    const key = makeSessionKey(deckIds, userId);
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(STORE, "readwrite");
       const req = tx.objectStore(STORE).delete(key);

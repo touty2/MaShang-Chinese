@@ -18,6 +18,7 @@ import { addWordToDeck, MAIN_DECK_ID } from "@/lib/deckStore";
 import { trpc } from "@/lib/trpc";
 import { useSettings } from "@/contexts/SettingsContext";
 import { cn } from "@/lib/utils";
+import { numericToTone } from "@/lib/pinyin";
 
 // ─── Segmentation Override Store (localStorage) ───────────────────────────────
 const SEG_OVERRIDES_KEY = "mashang_seg_overrides";
@@ -75,7 +76,7 @@ interface WordPopupProps {
 
 function WordPopup({ word, entry, storyDef, inDeck, anchor, onAdd, onRemove, onClose, onSpeak, contextChars, onSegmentationChange }: WordPopupProps) {
   // Merge: story vocab definition takes priority; cedict fills in pinyin if missing
-  const displayPinyin = storyDef?.pinyin || entry?.pinyinDisplay || entry?.pinyin || "";
+  const displayPinyin = numericToTone(storyDef?.pinyin || entry?.pinyinDisplay || entry?.pinyin || "");
   const displayDefs: string[] = storyDef?.definition
     ? [storyDef.definition, ...(entry?.definitions.filter(d => d.toLowerCase() !== storyDef.definition.toLowerCase()) ?? []).slice(0, 3)]
     : (entry?.definitions ?? []).slice(0, 4);
@@ -766,7 +767,7 @@ function VocabRow({
       </button>
       <div className="flex-1 min-w-0">
         <span className="font-medium text-sm text-foreground">{vocab.word}</span>
-        <span className="text-xs text-muted-foreground ml-1.5">{vocab.pinyin}</span>
+        <span className="text-xs text-muted-foreground ml-1.5">{numericToTone(vocab.pinyin)}</span>
         <p className="text-xs text-muted-foreground truncate">{vocab.definition}</p>
       </div>
       <button

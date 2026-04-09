@@ -17,6 +17,7 @@ import {
   MAIN_DECK_ID, MY_VOCAB_ID
 } from "@/lib/deckStore";
 import { cn } from "@/lib/utils";
+import { numericToTone } from "@/lib/pinyin";
 
 const MY_WORDS_KEY = "mashang_my_words";
 
@@ -86,7 +87,7 @@ function VocabTable({
           </button>
           <div className="flex-1 min-w-0 grid grid-cols-[auto_1fr] gap-x-3 items-baseline">
             <span className="font-medium text-sm text-foreground">{v.word}</span>
-            <span className="text-xs text-muted-foreground truncate">{v.pinyin} — {v.definition}</span>
+            <span className="text-xs text-muted-foreground truncate">{numericToTone(v.pinyin)} — {v.definition}</span>
           </div>
           <div className="flex items-center gap-1.5 flex-shrink-0">
             {showHsk && v.hskBand && (
@@ -177,7 +178,7 @@ export default function Vocab() {
         await loadDictionary();
         const entry = await lookupWord(value.trim());
         if (entry) {
-          setNewPinyin(entry.pinyinDisplay || entry.pinyin);
+          setNewPinyin(numericToTone(entry.pinyinDisplay || entry.pinyin));
           setNewDef(entry.definitions.slice(0, 3).join("; "));
           setLookupNotFound(false);
         } else {

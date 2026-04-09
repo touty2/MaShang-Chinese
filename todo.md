@@ -77,6 +77,10 @@
 - [x] Completed session stays on "All done" screen until next day's cards arrive
 - [x] Session state survives browser restarts and re-logins
 
+## Flashcard Bug Fixes (Round 2)
+- [x] Fix card flip transition: next card's back face briefly visible during flip animation
+- [x] Fix pinyin display: convert numeric tones (e.g. xue2 xi2) to diacritic marks (xué xí)
+
 ## Future Enhancements
 - [ ] Pinyin display toggle (show/hide pinyin above characters in story reader)
 - [ ] Story deck auto-generation from story vocabulary

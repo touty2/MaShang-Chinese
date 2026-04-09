@@ -28,10 +28,12 @@ import {
   MAIN_DECK_ID, MY_VOCAB_ID
 } from "@/lib/deckStore";
 import { useSettings } from "@/contexts/SettingsContext";
+import { useAuth } from "@/_core/hooks/useAuth";
 import { cn } from "@/lib/utils";
 import { addWord } from "@/lib/flashcardStore";
 import { addWordToDeck } from "@/lib/deckStore";
 import { loadDictionary, lookupWord } from "@/lib/dictionary";
+import { numericToTone } from "@/lib/pinyin";
 import {
   loadSession, saveSession, clearSession, pruneOldSessions,
   makeSessionKey, serializeKey, type CardKey, type PersistedSession
@@ -129,6 +131,10 @@ function ReviewSession({
     () => (initialSession?.isDone ?? false) && initialQueueRef.current.length === 0
   );
   const [largeFontMode, setLargeFontMode] = useState(false);
+  // pendingNext holds the next card to show AFTER the flip-back animation completes,
+  // preventing the next card's back face from being briefly visible during the transition.
+  const pendingNextRef = useRef<FlashCard | null>(null);
+  const flipAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const speak = useCallback((text: string) => {
     if (!window.speechSynthesis) return;
@@ -178,8 +184,16 @@ function ReviewSession({
       onDone(newReviewed);
     } else {
       setQueue(remaining);
-      setCurrent(remaining[0]);
+      // Stage the next card — flip back first, then swap content after animation
+      pendingNextRef.current = remaining[0];
       setFlipped(false);
+      // Clear any previous timer
+      if (flipAnimTimerRef.current) clearTimeout(flipAnimTimerRef.current);
+      // Swap card content after the CSS transition (0.5s) completes
+      flipAnimTimerRef.current = setTimeout(() => {
+        setCurrent(pendingNextRef.current);
+        pendingNextRef.current = null;
+      }, 520); // slightly longer than the 0.5s CSS transition
     }
   }, [current, queue, reviewed, reviewedKeys, deckIds, settings, onDone, onSaveSession]);
 
@@ -269,7 +283,7 @@ function ReviewSession({
               <span className={cn("font-bold text-foreground leading-none tracking-tight", charSize)}>
                 {current.word}
               </span>
-              <p className="text-primary text-lg font-medium tracking-wide">{current.pinyin}</p>
+              <p className="text-primary text-lg font-medium tracking-wide">{numericToTone(current.pinyin)}</p>
             </div>
             <div className="px-8 py-5 overflow-y-auto max-h-48">
               <p className="text-xs font-semibold uppercase tracking-widest text-muted-foreground mb-3">DEFINITION</p>
@@ -509,6 +523,8 @@ function DeckTogglePanel({
 
 export default function Deck() {
   const { settings } = useSettings();
+  const { user } = useAuth();
+  const userId = user?.email ?? undefined;
   const [allCards, setAllCards] = useState<FlashCard[]>([]);
   const [loading, setLoading] = useState(true);
   const [reviewing, setReviewing] = useState(false);
@@ -546,7 +562,7 @@ export default function Deck() {
         await loadDictionary();
         const entry = await lookupWord(value.trim());
         if (entry) {
-          setNewPinyin(entry.pinyinDisplay || entry.pinyin);
+          setNewPinyin(numericToTone(entry.pinyinDisplay || entry.pinyin));
           setNewDef(entry.definitions.slice(0, 3).join("; "));
           setLookupNotFound(false);
         } else {
@@ -590,7 +606,7 @@ export default function Deck() {
   useEffect(() => {
     if (loading) return;
     const deckIds = Array.from(selectedDeckIds);
-    loadSession(deckIds).then((session) => {
+    loadSession(deckIds, userId).then((session) => {
       setPersistedSession(session);
       setSessionLoaded(true);
     });
@@ -684,7 +700,7 @@ export default function Deck() {
   // Persist session state after each card rating
   const handleSaveSession = useCallback(async (session: PersistedSession) => {
     const deckIds = Array.from(selectedDeckIds);
-    await saveSession(deckIds, session);
+    await saveSession(deckIds, session, userId);
     setPersistedSession(session);
   }, [selectedDeckIds]);
 
@@ -709,7 +725,7 @@ export default function Deck() {
         <div className="flex items-center gap-3 mb-6">
           <Button variant="ghost" size="sm" onClick={async () => {
             // Clear the session so the user can restart fresh if they exit mid-session
-            await clearSession(Array.from(selectedDeckIds));
+            await clearSession(Array.from(selectedDeckIds), userId);
             setPersistedSession(null);
             setReviewing(false);
             loadAll();
@@ -732,7 +748,7 @@ export default function Deck() {
             setReviewing(false);
             await loadAll();
             // Reload the persisted session to reflect isDone=true
-            const updated = await loadSession(Array.from(selectedDeckIds));
+            const updated = await loadSession(Array.from(selectedDeckIds), userId);
             setPersistedSession(updated);
           }}
         />
@@ -812,7 +828,7 @@ export default function Deck() {
               size="sm"
               variant="outline"
               onClick={async () => {
-                await clearSession(Array.from(selectedDeckIds));
+                await clearSession(Array.from(selectedDeckIds), userId);
                 setPersistedSession(null);
                 await loadAll();
               }}
@@ -862,7 +878,7 @@ export default function Deck() {
                 <div key={word} className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted/50 transition-colors group">
                   <div className="flex-1 min-w-0">
                     <span className="font-medium text-sm text-foreground">{word}</span>
-                    <span className="text-xs text-muted-foreground ml-2">{card.pinyin}</span>
+                    <span className="text-xs text-muted-foreground ml-2">{numericToTone(card.pinyin)}</span>
                     <p className="text-xs text-muted-foreground truncate">{card.definition}</p>
                   </div>
                   <div className="flex items-center gap-1.5 flex-shrink-0">
