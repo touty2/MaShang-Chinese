@@ -13,26 +13,17 @@ import { loadStories, getUniqueVocab, type StoryVocab } from "@/lib/stories";
 import { addWord, removeWord, getAllCards } from "@/lib/flashcardStore";
 import { loadDictionary, lookupWord } from "@/lib/dictionary";
 import {
-  getAllDecks, addWordToDeck, getDeckCounts, type LocalDeck,
+  getAllDecks, addWordToDeck, removeWordFromDeck, getWordsInDeck, type LocalDeck,
   MAIN_DECK_ID, MY_VOCAB_ID
 } from "@/lib/deckStore";
 import { cn } from "@/lib/utils";
 import { numericToTone } from "@/lib/pinyin";
-
-const MY_WORDS_KEY = "mashang_my_words";
 
 interface MyWord {
   word: string;
   pinyin: string;
   definition: string;
   addedAt: number;
-}
-
-function getMyWords(): MyWord[] {
-  try { return JSON.parse(localStorage.getItem(MY_WORDS_KEY) || "[]"); } catch { return []; }
-}
-function saveMyWords(words: MyWord[]) {
-  localStorage.setItem(MY_WORDS_KEY, JSON.stringify(words));
 }
 
 function speak(text: string, speed = 1.0) {
@@ -124,7 +115,7 @@ function VocabTable({
 
 export default function Vocab() {
   const [allVocab, setAllVocab] = useState<(StoryVocab & { hskBand?: string })[]>([]);
-  const [myWords, setMyWords] = useState<MyWord[]>(getMyWords());
+  const [myWords, setMyWords] = useState<MyWord[]>([]);
   const [deckWords, setDeckWords] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -141,6 +132,24 @@ export default function Vocab() {
   const [availableDecks, setAvailableDecks] = useState<LocalDeck[]>([]);
   const lookupTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Derive My Words from the MY_VOCAB_ID deck in IndexedDB so it stays in sync
+  const refreshMyWords = useCallback(async (cards?: import("@/lib/flashcardStore").FlashCard[]) => {
+    const [myVocabWords, allCards] = await Promise.all([
+      getWordsInDeck(MY_VOCAB_ID),
+      cards ? Promise.resolve(cards) : getAllCards(),
+    ]);
+    const cardSet = new Set(allCards.map((c) => c.word));
+    const cardDetails = new Map(allCards.map((c) => [c.word, c]));
+    const words: MyWord[] = myVocabWords
+      .filter((w) => cardSet.has(w))
+      .map((w) => {
+        const card = cardDetails.get(w)!;
+        return { word: w, pinyin: card.pinyin, definition: card.definition, addedAt: card.updatedAt };
+      })
+      .sort((a, b) => b.addedAt - a.addedAt);
+    setMyWords(words);
+  }, []);
+
   useEffect(() => {
     async function load() {
       // Load dictionary in parallel so it's ready when the user opens Add Word
@@ -154,10 +163,11 @@ export default function Vocab() {
       setAllVocab(vocab);
       setDeckWords(new Set(cards.map((c) => c.word)));
       setAvailableDecks(decks);
+      await refreshMyWords(cards);
       setLoading(false);
     }
     load();
-  }, []);
+  }, [refreshMyWords]);
 
   // Auto-fill pinyin + definition when word changes
   const handleWordChange = useCallback(async (value: string) => {
@@ -241,40 +251,35 @@ export default function Vocab() {
 
   const handleAddMyWord = useCallback(async () => {
     if (!newWord.trim()) return;
-    const word: MyWord = {
-      word: newWord.trim(),
-      pinyin: newPinyin.trim(),
-      definition: newDef.trim(),
-      addedAt: Date.now(),
-    };
-    const updated = [word, ...myWords.filter((w) => w.word !== word.word)];
-    setMyWords(updated);
-    saveMyWords(updated);
+    const w = newWord.trim();
 
     // Add to flashcard store
-    await addWord(word.word, word.pinyin, word.definition, "Custom");
+    await addWord(w, newPinyin.trim(), newDef.trim(), "Custom");
 
     // Add to selected decks (default: My Words)
     const decksToAdd = selectedDeckIds.size > 0 ? Array.from(selectedDeckIds) : [MY_VOCAB_ID];
     for (const deckId of decksToAdd) {
-      await addWordToDeck(deckId, word.word);
+      await addWordToDeck(deckId, w);
     }
 
-    setDeckWords((prev) => { const n = new Set(prev); n.add(word.word); return n; });
+    setDeckWords((prev) => { const n = new Set(prev); n.add(w); return n; });
+    // Refresh My Words from deck store so the tab stays in sync
+    await refreshMyWords();
     setAddDialogOpen(false);
     setNewWord(""); setNewPinyin(""); setNewDef("");
     setSelectedDeckIds(new Set([MY_VOCAB_ID]));
-    toast.success(`Added "${word.word}" to My Words`);
-  }, [newWord, newPinyin, newDef, myWords, selectedDeckIds]);
+    toast.success(`Added "${w}" to My Words`);
+  }, [newWord, newPinyin, newDef, selectedDeckIds, refreshMyWords]);
 
   const handleDeleteMyWord = useCallback(async (word: string) => {
-    const updated = myWords.filter((w) => w.word !== word);
-    setMyWords(updated);
-    saveMyWords(updated);
+    // Remove from MY_VOCAB_ID deck and flashcard store
+    await removeWordFromDeck(MY_VOCAB_ID, word);
     await removeWord(word);
     setDeckWords((prev) => { const n = new Set(prev); n.delete(word); return n; });
+    // Refresh My Words from deck store
+    await refreshMyWords();
     toast.success(`Removed "${word}"`);
-  }, [myWords]);
+  }, [refreshMyWords]);
 
   const openAddDialog = () => {
     setNewWord(""); setNewPinyin(""); setNewDef("");

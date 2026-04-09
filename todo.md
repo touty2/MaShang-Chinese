@@ -81,6 +81,9 @@
 - [x] Fix card flip transition: next card's back face briefly visible during flip animation
 - [x] Fix pinyin display: convert numeric tones (e.g. xue2 xi2) to diacritic marks (xué xí)
 
+## Vocab Page Bug Fix
+- [x] Fix "My Words" tab: words added to deck disappear from tab — now reads directly from MY_VOCAB_ID deck in IndexedDB
+
 ## Future Enhancements
 - [ ] Pinyin display toggle (show/hide pinyin above characters in story reader)
 - [ ] Story deck auto-generation from story vocabulary
